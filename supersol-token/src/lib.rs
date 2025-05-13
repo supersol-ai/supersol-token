@@ -114,3 +114,9 @@ pub fn check_program_account(spl_token_program_id: &Pubkey) -> ProgramResult {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    mod authority_tests;
+    mod shared_liquidity_tests;
+}

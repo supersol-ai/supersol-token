@@ -81,6 +81,39 @@ impl Pack for Mint {
     }
 }
 
+impl Mint {
+    /// Checks if the token is eligible for shared liquidity
+    ///
+    /// A token is considered eligible for shared liquidity if:
+    /// 1. It has a fixed supply (no mint authority)
+    /// 2. It has a reasonable number of decimals (between 0 and 9)
+    /// 3. It has a non-zero supply
+    /// 4. It is initialized
+    pub fn is_eligible_for_shared_liquidity(&self) -> bool {
+        // Check if token is initialized
+        if !self.is_initialized {
+            return false;
+        }
+
+        // Check if token has a fixed supply (no mint authority)
+        if self.mint_authority.is_some() {
+            return false;
+        }
+
+        // Check if token has reasonable decimals (0-9)
+        if self.decimals > 9 {
+            return false;
+        }
+
+        // Check if token has non-zero supply
+        if self.supply == 0 {
+            return false;
+        }
+
+        true
+    }
+}
+
 /// Account data.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

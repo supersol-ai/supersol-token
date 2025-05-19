@@ -1,6 +1,7 @@
 use {
     crate::state::{Account, Mint},
     solana_program_error::{ProgramError, ProgramResult},
+    solana_pubkey::Pubkey,
 };
 
 /// Maximum number of decimals allowed for shared liquidity tokens
@@ -44,6 +45,51 @@ impl SharedLiquidityCompatibility {
             Self::HasDelegates => Err(ProgramError::InvalidAccountData),
         }
     }
+}
+
+/// IBC channel configuration for cross-chain token transfers
+#[derive(Debug, Clone, PartialEq)]
+pub struct IbcChannel {
+    /// Source chain identifier
+    pub source_chain: String,
+    /// Destination chain identifier
+    pub destination_chain: String,
+    /// Channel ID for the IBC connection
+    pub channel_id: String,
+    /// Port ID for the IBC connection
+    pub port_id: String,
+    /// Whether the channel is active
+    pub is_active: bool,
+}
+
+/// Wrapped token configuration for cross-chain compatibility
+#[derive(Debug, Clone, PartialEq)]
+pub struct WrappedTokenConfig {
+    /// Original token's chain identifier
+    pub original_chain: String,
+    /// Original token's contract address
+    pub original_address: String,
+    /// Wrapped token's decimals
+    pub decimals: u8,
+    /// Whether the wrapped token is active
+    pub is_active: bool,
+}
+
+/// Liquidity pool configuration for shared liquidity tokens
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiquidityPool {
+    /// Token A's mint address
+    pub token_a_mint: Pubkey,
+    /// Token B's mint address
+    pub token_b_mint: Pubkey,
+    /// Pool's token A balance
+    pub token_a_balance: u64,
+    /// Pool's token B balance
+    pub token_b_balance: u64,
+    /// Pool's fee rate in basis points (e.g., 30 = 0.3%)
+    pub fee_rate: u16,
+    /// Whether the pool is active
+    pub is_active: bool,
 }
 
 /// Enhanced shared liquidity compatibility checks and token exchange functionality
@@ -173,13 +219,362 @@ impl SharedLiquidityChecker {
 
         Ok(())
     }
+
+    /// Register a new IBC channel for cross-chain token transfers
+    pub fn register_ibc_channel(
+        source_chain: String,
+        destination_chain: String,
+        channel_id: String,
+        port_id: String,
+    ) -> IbcChannel {
+        IbcChannel {
+            source_chain,
+            destination_chain,
+            channel_id,
+            port_id,
+            is_active: true,
+        }
+    }
+
+    /// Verify if a token is compatible for cross-chain transfer
+    pub fn verify_cross_chain_compatibility(
+        mint: &Mint,
+        ibc_channel: &IbcChannel,
+    ) -> Result<(), ProgramError> {
+        // Check if token is initialized
+        if !mint.is_initialized {
+            return Err(ProgramError::UninitializedAccount);
+        }
+
+        // Check if token has a fixed supply (no mint authority)
+        if mint.mint_authority.is_some() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check if token has reasonable decimals (0-9)
+        if mint.decimals > MAX_SHARED_LIQUIDITY_DECIMALS {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Check if token has valid supply range
+        if mint.supply < MIN_SHARED_LIQUIDITY_SUPPLY || mint.supply > MAX_SHARED_LIQUIDITY_SUPPLY {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Check if IBC channel is active
+        if !ibc_channel.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        Ok(())
+    }
+
+    /// Prepare token for cross-chain transfer
+    pub fn prepare_cross_chain_transfer(
+        source_account: &mut Account,
+        amount: u64,
+        ibc_channel: &IbcChannel,
+    ) -> Result<(), ProgramError> {
+        // Check if account has enough balance
+        if source_account.amount < amount {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Lock tokens for cross-chain transfer
+        source_account.amount = source_account
+            .amount
+            .checked_sub(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        Ok(())
+    }
+
+    /// Complete cross-chain token transfer
+    pub fn complete_cross_chain_transfer(
+        destination_account: &mut Account,
+        amount: u64,
+        ibc_channel: &IbcChannel,
+    ) -> Result<(), ProgramError> {
+        // Verify IBC channel is active
+        if !ibc_channel.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Add tokens to destination account
+        destination_account.amount = destination_account
+            .amount
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        Ok(())
+    }
+
+    /// Create a wrapped token configuration
+    pub fn create_wrapped_token_config(
+        original_chain: String,
+        original_address: String,
+        decimals: u8,
+    ) -> WrappedTokenConfig {
+        WrappedTokenConfig {
+            original_chain,
+            original_address,
+            decimals,
+            is_active: true,
+        }
+    }
+
+    /// Wrap tokens for cross-chain transfer
+    pub fn wrap_tokens(
+        source_account: &mut Account,
+        destination_account: &mut Account,
+        amount: u64,
+        wrapped_config: &WrappedTokenConfig,
+    ) -> Result<(), ProgramError> {
+        // Verify wrapped token is active
+        if !wrapped_config.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check if source account has enough balance
+        if source_account.amount < amount {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Lock original tokens
+        source_account.amount = source_account
+            .amount
+            .checked_sub(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Mint wrapped tokens
+        destination_account.amount = destination_account
+            .amount
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        Ok(())
+    }
+
+    /// Unwrap tokens after cross-chain transfer
+    pub fn unwrap_tokens(
+        wrapped_account: &mut Account,
+        original_account: &mut Account,
+        amount: u64,
+        wrapped_config: &WrappedTokenConfig,
+    ) -> Result<(), ProgramError> {
+        // Verify wrapped token is active
+        if !wrapped_config.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check if wrapped account has enough balance
+        if wrapped_account.amount < amount {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Burn wrapped tokens
+        wrapped_account.amount = wrapped_account
+            .amount
+            .checked_sub(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Unlock original tokens
+        original_account.amount = original_account
+            .amount
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        Ok(())
+    }
+
+    /// Create a new liquidity pool for two compatible tokens
+    pub fn create_liquidity_pool(
+        token_a_mint: Pubkey,
+        token_b_mint: Pubkey,
+        fee_rate: u16,
+    ) -> Result<LiquidityPool, ProgramError> {
+        // Validate fee rate (max 1%)
+        if fee_rate > 100 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        Ok(LiquidityPool {
+            token_a_mint,
+            token_b_mint,
+            token_a_balance: 0,
+            token_b_balance: 0,
+            fee_rate,
+            is_active: true,
+        })
+    }
+
+    /// Add liquidity to the pool
+    pub fn add_liquidity(
+        pool: &mut LiquidityPool,
+        token_a_account: &mut Account,
+        token_b_account: &mut Account,
+        token_a_amount: u64,
+        token_b_amount: u64,
+    ) -> Result<(), ProgramError> {
+        // Verify pool is active
+        if !pool.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check if accounts have enough balance
+        if token_a_account.amount < token_a_amount || token_b_account.amount < token_b_amount {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Transfer tokens to pool
+        token_a_account.amount = token_a_account
+            .amount
+            .checked_sub(token_a_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        token_b_account.amount = token_b_account
+            .amount
+            .checked_sub(token_b_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Update pool balances
+        pool.token_a_balance = pool
+            .token_a_balance
+            .checked_add(token_a_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        pool.token_b_balance = pool
+            .token_b_balance
+            .checked_add(token_b_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        Ok(())
+    }
+
+    /// Remove liquidity from the pool
+    pub fn remove_liquidity(
+        pool: &mut LiquidityPool,
+        token_a_account: &mut Account,
+        token_b_account: &mut Account,
+        token_a_amount: u64,
+        token_b_amount: u64,
+    ) -> Result<(), ProgramError> {
+        // Verify pool is active
+        if !pool.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check if pool has enough balance
+        if pool.token_a_balance < token_a_amount || pool.token_b_balance < token_b_amount {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Transfer tokens from pool
+        pool.token_a_balance = pool
+            .token_a_balance
+            .checked_sub(token_a_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        pool.token_b_balance = pool
+            .token_b_balance
+            .checked_sub(token_b_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Update account balances
+        token_a_account.amount = token_a_account
+            .amount
+            .checked_add(token_a_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        token_b_account.amount = token_b_account
+            .amount
+            .checked_add(token_b_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        Ok(())
+    }
+
+    /// Calculate swap amount using constant product formula (x * y = k)
+    pub fn calculate_swap_amount(
+        pool: &LiquidityPool,
+        input_amount: u64,
+        is_token_a_to_b: bool,
+    ) -> Result<u64, ProgramError> {
+        // Verify pool is active
+        if !pool.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let (input_balance, output_balance) = if is_token_a_to_b {
+            (pool.token_a_balance, pool.token_b_balance)
+        } else {
+            (pool.token_b_balance, pool.token_a_balance)
+        };
+
+        // Calculate output amount using constant product formula
+        let input_balance_f = input_balance as f64;
+        let output_balance_f = output_balance as f64;
+        let input_amount_f = input_amount as f64;
+        let fee_amount = (input_amount_f * pool.fee_rate as f64) / 10000.0;
+        let input_amount_after_fee = input_amount_f - fee_amount;
+
+        let output_amount = (output_balance_f * input_amount_after_fee)
+            / (input_balance_f + input_amount_after_fee);
+
+        Ok(output_amount as u64)
+    }
+
+    /// Execute a token swap in the pool
+    pub fn execute_swap(
+        pool: &mut LiquidityPool,
+        input_account: &mut Account,
+        output_account: &mut Account,
+        input_amount: u64,
+        is_token_a_to_b: bool,
+    ) -> Result<u64, ProgramError> {
+        // Calculate output amount
+        let output_amount = Self::calculate_swap_amount(pool, input_amount, is_token_a_to_b)?;
+
+        // Check if accounts have enough balance
+        if input_account.amount < input_amount {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Update pool balances
+        if is_token_a_to_b {
+            pool.token_a_balance = pool
+                .token_a_balance
+                .checked_add(input_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            pool.token_b_balance = pool
+                .token_b_balance
+                .checked_sub(output_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        } else {
+            pool.token_b_balance = pool
+                .token_b_balance
+                .checked_add(input_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            pool.token_a_balance = pool
+                .token_a_balance
+                .checked_sub(output_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
+
+        // Update account balances
+        input_account.amount = input_account
+            .amount
+            .checked_sub(input_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        output_account.amount = output_account
+            .amount
+            .checked_add(output_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        Ok(output_amount)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use solana_program_option::COption;
-    use solana_pubkey::Pubkey;
 
     #[test]
     fn test_mint_compatibility() {
@@ -322,5 +717,200 @@ mod tests {
 
         assert_eq!(source_account.amount, 0);
         assert_eq!(destination_account.amount, 2000);
+    }
+
+    #[test]
+    fn test_cross_chain_transfer() {
+        let mint = Mint {
+            mint_authority: COption::None,
+            supply: 1_000_000,
+            decimals: 9,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+
+        let mut source_account = Account {
+            mint: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            amount: 1000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut destination_account = Account {
+            mint: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            amount: 0,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Create IBC channel
+        let ibc_channel = SharedLiquidityChecker::register_ibc_channel(
+            "supersol".to_string(),
+            "ethereum".to_string(),
+            "channel-1".to_string(),
+            "transfer".to_string(),
+        );
+
+        // Verify cross-chain compatibility
+        assert!(
+            SharedLiquidityChecker::verify_cross_chain_compatibility(&mint, &ibc_channel).is_ok()
+        );
+
+        // Prepare cross-chain transfer
+        assert!(SharedLiquidityChecker::prepare_cross_chain_transfer(
+            &mut source_account,
+            500,
+            &ibc_channel
+        )
+        .is_ok());
+        assert_eq!(source_account.amount, 500);
+
+        // Complete cross-chain transfer
+        assert!(SharedLiquidityChecker::complete_cross_chain_transfer(
+            &mut destination_account,
+            500,
+            &ibc_channel
+        )
+        .is_ok());
+        assert_eq!(destination_account.amount, 500);
+    }
+
+    #[test]
+    fn test_token_wrapping() {
+        let mut original_account = Account {
+            mint: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            amount: 1000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut wrapped_account = Account {
+            mint: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            amount: 0,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Create wrapped token configuration
+        let wrapped_config = SharedLiquidityChecker::create_wrapped_token_config(
+            "ethereum".to_string(),
+            "0x123...".to_string(),
+            18,
+        );
+
+        // Test wrapping tokens
+        assert!(SharedLiquidityChecker::wrap_tokens(
+            &mut original_account,
+            &mut wrapped_account,
+            500,
+            &wrapped_config
+        )
+        .is_ok());
+        assert_eq!(original_account.amount, 500);
+        assert_eq!(wrapped_account.amount, 500);
+
+        // Test unwrapping tokens
+        assert!(SharedLiquidityChecker::unwrap_tokens(
+            &mut wrapped_account,
+            &mut original_account,
+            500,
+            &wrapped_config
+        )
+        .is_ok());
+        assert_eq!(wrapped_account.amount, 0);
+        assert_eq!(original_account.amount, 1000);
+    }
+
+    #[test]
+    fn test_liquidity_pool() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+
+        // Create liquidity pool
+        let mut pool = SharedLiquidityChecker::create_liquidity_pool(
+            token_a_mint,
+            token_b_mint,
+            30, // 0.3% fee
+        )
+        .unwrap();
+
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Test adding liquidity
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            500,
+            500
+        )
+        .is_ok());
+        assert_eq!(pool.token_a_balance, 500);
+        assert_eq!(pool.token_b_balance, 500);
+        assert_eq!(token_a_account.amount, 500);
+        assert_eq!(token_b_account.amount, 500);
+
+        // Test swapping tokens
+        let output_amount = SharedLiquidityChecker::execute_swap(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            100,
+            true,
+        )
+        .unwrap();
+        assert!(output_amount > 0);
+        assert_eq!(token_a_account.amount, 400);
+        assert_eq!(token_b_account.amount, 500 + output_amount);
+
+        // Test removing liquidity
+        assert!(SharedLiquidityChecker::remove_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            400,
+            400
+        )
+        .is_ok());
+        assert_eq!(pool.token_a_balance, 100);
+        assert_eq!(pool.token_b_balance, 100);
+        assert_eq!(token_a_account.amount, 800);
+        assert_eq!(token_b_account.amount, 900);
     }
 }

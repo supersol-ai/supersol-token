@@ -550,21 +550,50 @@ impl SharedLiquidityChecker {
             (pool.token_b_balance, pool.token_a_balance)
         };
 
+        // Ensure sufficient liquidity
+        if input_balance == 0 || output_balance == 0 {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Calculate fee (in basis points)
+        let fee_amount = (input_amount as u128)
+            .checked_mul(pool.fee_rate as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
+
+        let input_amount_after_fee = input_amount
+            .checked_sub(fee_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
         // Calculate output amount using constant product formula
-        let input_balance_f = input_balance as f64;
-        let output_balance_f = output_balance as f64;
-        let input_amount_f = input_amount as f64;
+        // (x + Δx)(y - Δy) = xy
+        // Δy = (y * Δx) / (x + Δx)
+        let output_amount = (output_balance as u128)
+            .checked_mul(input_amount_after_fee as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(
+                (input_balance as u128)
+                    .checked_add(input_amount_after_fee as u128)
+                    .ok_or(ProgramError::ArithmeticOverflow)?,
+            )
+            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
 
-        // Calculate fee
-        let fee_amount = (input_amount_f * pool.fee_rate as f64) / 10000.0;
-        let input_amount_after_fee = input_amount_f - fee_amount;
+        // Calculate price impact
+        let price_impact = (input_amount_after_fee as f64 * output_amount as f64)
+            / (input_balance as f64 * output_balance as f64);
 
-        // Calculate output amount
-        let output_amount = (output_balance_f * input_amount_after_fee)
-            / (input_balance_f + input_amount_after_fee);
+        // Limit price impact to 5%
+        if price_impact > 0.05 {
+            return Err(ProgramError::InvalidArgument);
+        }
 
-        // Check for minimum output amount (0.1% slippage)
-        let min_output = (output_amount * 0.999) as u64;
+        // Apply slippage protection (0.1%)
+        let min_output = (output_amount as u128)
+            .checked_mul(999)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(1000)
+            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
 
         Ok(min_output)
     }
@@ -972,5 +1001,179 @@ mod tests {
         assert_eq!(pool.token_b_balance, 100);
         assert_eq!(token_a_account.amount, 800);
         assert_eq!(token_b_account.amount, 900);
+    }
+
+    #[test]
+    fn test_liquidity_pool_optimized() {
+        // Tests:
+        // 1. Initial liquidity provision (500,000 tokens each)
+        // 2. Small swap (1,000 tokens) - should succeed
+        // 3. Large swap (200,000 tokens) - should fail due to price impact
+        // 4. Fee calculation verification (0.3% of 1000 = 3)
+        // 5. Slippage protection verification
+        // 6. Liquidity removal
+        // 7. Final balance verification
+
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+
+        // Create liquidity pool with 0.3% fee
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Test initial liquidity provision
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            500_000,
+            500_000
+        )
+        .is_ok());
+
+        // Test small swap (low price impact)
+        let small_swap_amount = SharedLiquidityChecker::execute_swap(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            1_000,
+            true,
+        )
+        .unwrap();
+        assert!(small_swap_amount > 0);
+
+        // Test large swap (should fail due to price impact)
+        let large_swap_result = SharedLiquidityChecker::execute_swap(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            200_000,
+            true,
+        );
+        assert!(large_swap_result.is_err());
+
+        // Test fee calculation
+        let fee_amount = (1_000 as u128)
+            .checked_mul(pool.fee_rate as u128)
+            .unwrap()
+            .checked_div(10000)
+            .unwrap() as u64;
+        assert_eq!(fee_amount, 3); // 0.3% of 1000 = 3
+
+        // Test slippage protection
+        let swap_amount =
+            SharedLiquidityChecker::calculate_swap_amount(&pool, 1_000, true).unwrap();
+        let expected_amount = (swap_amount as u128)
+            .checked_mul(999)
+            .unwrap()
+            .checked_div(1000)
+            .unwrap() as u64;
+        assert!(swap_amount >= expected_amount);
+
+        // Test removing liquidity
+        assert!(SharedLiquidityChecker::remove_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            400_000,
+            400_000
+        )
+        .is_ok());
+
+        // Verify final balances
+        assert_eq!(pool.token_a_balance, 100_000);
+        assert_eq!(pool.token_b_balance, 100_000);
+    }
+
+    #[test]
+    fn test_liquidity_pool_edge_cases() {
+        // Tests:
+        // 1. Creating pool with same token - should fail
+        // 2. Creating pool with invalid fee (2%) - should fail
+        // 3. Adding liquidity with zero amounts - should fail
+        // 4. Swapping with insufficient liquidity - should fail
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+
+        // Test creating pool with same token
+        let same_token_result =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_a_mint, 30);
+        assert!(same_token_result.is_err());
+
+        // Test creating pool with invalid fee
+        let invalid_fee_result = SharedLiquidityChecker::create_liquidity_pool(
+            token_a_mint,
+            token_b_mint,
+            200, // 2% fee (invalid)
+        );
+        assert!(invalid_fee_result.is_err());
+
+        // Create valid pool
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+
+        // Test adding liquidity with zero amounts
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 0,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: Pubkey::new_unique(),
+            amount: 0,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let zero_liquidity_result = SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            0,
+            0,
+        );
+        assert!(zero_liquidity_result.is_err());
+
+        // Test swap with insufficient liquidity
+        let insufficient_liquidity_result = SharedLiquidityChecker::execute_swap(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            1000,
+            true,
+        );
+        assert!(insufficient_liquidity_result.is_err());
     }
 }

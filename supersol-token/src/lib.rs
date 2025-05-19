@@ -8,6 +8,9 @@ pub mod error;
 pub mod instruction;
 pub mod native_mint;
 pub mod processor;
+/// Module for shared liquidity functionality, allowing compatible tokens to be exchanged
+/// based on their supply ratios. Tokens must meet specific criteria to be eligible for
+/// shared liquidity, including fixed supply, reasonable decimals, and valid supply range.
 pub mod shared_liquidity;
 pub mod state;
 

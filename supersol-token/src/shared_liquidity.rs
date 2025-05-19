@@ -398,6 +398,11 @@ impl SharedLiquidityChecker {
             return Err(ProgramError::InvalidArgument);
         }
 
+        // Ensure token mints are different
+        if token_a_mint == token_b_mint {
+            return Err(ProgramError::InvalidArgument);
+        }
+
         Ok(LiquidityPool {
             token_a_mint,
             token_b_mint,
@@ -421,9 +426,43 @@ impl SharedLiquidityChecker {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        // Verify token accounts match pool tokens
+        if token_a_account.mint != pool.token_a_mint || token_b_account.mint != pool.token_b_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         // Check if accounts have enough balance
         if token_a_account.amount < token_a_amount || token_b_account.amount < token_b_amount {
             return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Calculate price ratio for first deposit
+        if pool.token_a_balance == 0 && pool.token_b_balance == 0 {
+            // First deposit, set initial price ratio
+            pool.token_a_balance = token_a_amount;
+            pool.token_b_balance = token_b_amount;
+        } else {
+            // Calculate expected token B amount based on current ratio
+            let expected_token_b = (token_a_amount as f64 * pool.token_b_balance as f64
+                / pool.token_a_balance as f64) as u64;
+
+            // Allow 1% slippage
+            let min_token_b = (expected_token_b * 99) / 100;
+            let max_token_b = (expected_token_b * 101) / 100;
+
+            if token_b_amount < min_token_b || token_b_amount > max_token_b {
+                return Err(ProgramError::InvalidArgument);
+            }
+
+            // Update pool balances
+            pool.token_a_balance = pool
+                .token_a_balance
+                .checked_add(token_a_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            pool.token_b_balance = pool
+                .token_b_balance
+                .checked_add(token_b_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
         }
 
         // Transfer tokens to pool
@@ -434,16 +473,6 @@ impl SharedLiquidityChecker {
         token_b_account.amount = token_b_account
             .amount
             .checked_sub(token_b_amount)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-
-        // Update pool balances
-        pool.token_a_balance = pool
-            .token_a_balance
-            .checked_add(token_a_amount)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        pool.token_b_balance = pool
-            .token_b_balance
-            .checked_add(token_b_amount)
             .ok_or(ProgramError::ArithmeticOverflow)?;
 
         Ok(())
@@ -462,12 +491,26 @@ impl SharedLiquidityChecker {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        // Verify token accounts match pool tokens
+        if token_a_account.mint != pool.token_a_mint || token_b_account.mint != pool.token_b_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         // Check if pool has enough balance
         if pool.token_a_balance < token_a_amount || pool.token_b_balance < token_b_amount {
             return Err(ProgramError::InsufficientFunds);
         }
 
-        // Transfer tokens from pool
+        // Calculate price impact
+        let price_impact = (token_a_amount as f64 * token_b_amount as f64)
+            / (pool.token_a_balance as f64 * pool.token_b_balance as f64);
+
+        // Limit price impact to 5%
+        if price_impact > 0.05 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Update pool balances
         pool.token_a_balance = pool
             .token_a_balance
             .checked_sub(token_a_amount)
@@ -477,7 +520,7 @@ impl SharedLiquidityChecker {
             .checked_sub(token_b_amount)
             .ok_or(ProgramError::ArithmeticOverflow)?;
 
-        // Update account balances
+        // Transfer tokens from pool
         token_a_account.amount = token_a_account
             .amount
             .checked_add(token_a_amount)
@@ -511,13 +554,19 @@ impl SharedLiquidityChecker {
         let input_balance_f = input_balance as f64;
         let output_balance_f = output_balance as f64;
         let input_amount_f = input_amount as f64;
+
+        // Calculate fee
         let fee_amount = (input_amount_f * pool.fee_rate as f64) / 10000.0;
         let input_amount_after_fee = input_amount_f - fee_amount;
 
+        // Calculate output amount
         let output_amount = (output_balance_f * input_amount_after_fee)
             / (input_balance_f + input_amount_after_fee);
 
-        Ok(output_amount as u64)
+        // Check for minimum output amount (0.1% slippage)
+        let min_output = (output_amount * 0.999) as u64;
+
+        Ok(min_output)
     }
 
     /// Execute a token swap in the pool
@@ -531,7 +580,18 @@ impl SharedLiquidityChecker {
         // Calculate output amount
         let output_amount = Self::calculate_swap_amount(pool, input_amount, is_token_a_to_b)?;
 
-        // Check if accounts have enough balance
+        // Verify token accounts match pool tokens
+        if is_token_a_to_b {
+            if input_account.mint != pool.token_a_mint || output_account.mint != pool.token_b_mint {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        } else {
+            if input_account.mint != pool.token_b_mint || output_account.mint != pool.token_a_mint {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+
+        // Check if input account has enough balance
         if input_account.amount < input_amount {
             return Err(ProgramError::InsufficientFunds);
         }

@@ -75,6 +75,51 @@ pub struct WrappedTokenConfig {
     pub is_active: bool,
 }
 
+/// Price oracle configuration for liquidity pool
+#[derive(Debug, Clone, PartialEq)]
+pub struct PriceOracle {
+    /// Last observed price of token A in terms of token B
+    pub last_price: f64,
+    /// Timestamp of last price update
+    pub last_update: i64,
+    /// Minimum time between price updates (in seconds)
+    pub min_update_interval: i64,
+    /// Maximum allowed price deviation (in basis points)
+    pub max_price_deviation: u16,
+    /// Whether the oracle is active
+    pub is_active: bool,
+}
+
+/// Liquidity mining configuration
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiquidityMining {
+    /// Total rewards allocated for mining
+    pub total_rewards: u64,
+    /// Remaining rewards to be distributed
+    pub remaining_rewards: u64,
+    /// Start timestamp of mining program
+    pub start_time: i64,
+    /// End timestamp of mining program
+    pub end_time: i64,
+    /// Reward rate per second
+    pub reward_rate: u64,
+    /// Total liquidity provider shares
+    pub total_shares: u64,
+    /// Whether mining is active
+    pub is_active: bool,
+}
+
+/// Liquidity provider position
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiquidityPosition {
+    /// Provider's share of the pool
+    pub shares: u64,
+    /// Last reward claim timestamp
+    pub last_claim_time: i64,
+    /// Accumulated rewards
+    pub accumulated_rewards: u64,
+}
+
 /// Liquidity pool configuration for shared liquidity tokens
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiquidityPool {
@@ -90,6 +135,31 @@ pub struct LiquidityPool {
     pub fee_rate: u16,
     /// Whether the pool is active
     pub is_active: bool,
+    /// Flash loan fee in basis points (e.g., 9 = 0.09%)
+    pub flash_loan_fee: u16,
+    /// Maximum flash loan amount as percentage of pool balance (e.g., 50 = 50%)
+    pub max_flash_loan_percentage: u8,
+    /// Price oracle configuration
+    pub price_oracle: PriceOracle,
+    /// Emergency pause configuration
+    pub emergency_pause: EmergencyPause,
+    /// Liquidity mining configuration
+    pub liquidity_mining: LiquidityMining,
+    /// Liquidity provider positions
+    pub positions: std::collections::HashMap<Pubkey, LiquidityPosition>,
+}
+
+/// Emergency pause configuration
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmergencyPause {
+    /// Whether the pool is paused
+    pub is_paused: bool,
+    /// Timestamp when the pool was paused
+    pub pause_timestamp: i64,
+    /// Maximum pause duration in seconds
+    pub max_pause_duration: i64,
+    /// Administrator public key
+    pub admin: Pubkey,
 }
 
 /// Enhanced shared liquidity compatibility checks and token exchange functionality
@@ -392,6 +462,7 @@ impl SharedLiquidityChecker {
         token_a_mint: Pubkey,
         token_b_mint: Pubkey,
         fee_rate: u16,
+        admin: Pubkey,
     ) -> Result<LiquidityPool, ProgramError> {
         // Validate fee rate (max 1%)
         if fee_rate > 100 {
@@ -410,10 +481,374 @@ impl SharedLiquidityChecker {
             token_b_balance: 0,
             fee_rate,
             is_active: true,
+            flash_loan_fee: 9,             // 0.09% flash loan fee
+            max_flash_loan_percentage: 50, // 50% of pool balance
+            price_oracle: PriceOracle {
+                last_price: 0.0,
+                last_update: 0,
+                min_update_interval: 60,  // 1 minute
+                max_price_deviation: 100, // 1% maximum deviation
+                is_active: true,
+            },
+            emergency_pause: EmergencyPause {
+                is_paused: false,
+                pause_timestamp: 0,
+                max_pause_duration: 86400, // 24 hours
+                admin,
+            },
+            liquidity_mining: LiquidityMining {
+                total_rewards: 0,
+                remaining_rewards: 0,
+                start_time: 0,
+                end_time: 0,
+                reward_rate: 0,
+                total_shares: 0,
+                is_active: false,
+            },
+            positions: std::collections::HashMap::new(),
         })
     }
 
-    /// Add liquidity to the pool
+    /// Update price oracle with new price
+    pub fn update_price_oracle(
+        pool: &mut LiquidityPool,
+        new_price: f64,
+        current_time: i64,
+    ) -> Result<(), ProgramError> {
+        // Verify oracle is active
+        if !pool.price_oracle.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check update interval
+        if current_time - pool.price_oracle.last_update < pool.price_oracle.min_update_interval {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Check price deviation
+        if pool.price_oracle.last_price > 0.0 {
+            let price_change =
+                (new_price - pool.price_oracle.last_price).abs() / pool.price_oracle.last_price;
+            let max_deviation = pool.price_oracle.max_price_deviation as f64 / 10000.0;
+
+            if price_change > max_deviation {
+                return Err(ProgramError::InvalidArgument);
+            }
+        }
+
+        // Update oracle
+        pool.price_oracle.last_price = new_price;
+        pool.price_oracle.last_update = current_time;
+
+        Ok(())
+    }
+
+    /// Calculate current pool price
+    pub fn calculate_pool_price(pool: &LiquidityPool) -> Result<f64, ProgramError> {
+        if pool.token_a_balance == 0 || pool.token_b_balance == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        Ok(pool.token_b_balance as f64 / pool.token_a_balance as f64)
+    }
+
+    /// Validate price against oracle
+    pub fn validate_price(pool: &LiquidityPool) -> Result<(), ProgramError> {
+        // Skip validation if oracle is not active
+        if !pool.price_oracle.is_active {
+            return Ok(());
+        }
+
+        // Skip validation if no price history
+        if pool.price_oracle.last_price == 0.0 {
+            return Ok(());
+        }
+
+        let current_price = Self::calculate_pool_price(pool)?;
+        let price_change =
+            (current_price - pool.price_oracle.last_price).abs() / pool.price_oracle.last_price;
+        let max_deviation = pool.price_oracle.max_price_deviation as f64 / 10000.0;
+
+        if price_change > max_deviation {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        Ok(())
+    }
+
+    /// Execute a token swap in the pool with pause check
+    pub fn execute_swap(
+        pool: &mut LiquidityPool,
+        input_account: &mut Account,
+        output_account: &mut Account,
+        input_amount: u64,
+        is_token_a_to_b: bool,
+    ) -> Result<u64, ProgramError> {
+        // Check if pool is paused
+        Self::check_pause(pool)?;
+
+        // Validate price before swap
+        Self::validate_price(pool)?;
+
+        // Calculate output amount
+        let output_amount = Self::calculate_swap_amount(pool, input_amount, is_token_a_to_b)?;
+
+        // Verify token accounts match pool tokens
+        if is_token_a_to_b {
+            if input_account.mint != pool.token_a_mint || output_account.mint != pool.token_b_mint {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        } else {
+            if input_account.mint != pool.token_b_mint || output_account.mint != pool.token_a_mint {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+
+        // Check if input account has enough balance
+        if input_account.amount < input_amount {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Update pool balances
+        if is_token_a_to_b {
+            pool.token_a_balance = pool
+                .token_a_balance
+                .checked_add(input_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            pool.token_b_balance = pool
+                .token_b_balance
+                .checked_sub(output_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        } else {
+            pool.token_b_balance = pool
+                .token_b_balance
+                .checked_add(input_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            pool.token_a_balance = pool
+                .token_a_balance
+                .checked_sub(output_amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
+
+        // Update account balances
+        input_account.amount = input_account
+            .amount
+            .checked_sub(input_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        output_account.amount = output_account
+            .amount
+            .checked_add(output_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Update price oracle after successful swap
+        let new_price = Self::calculate_pool_price(pool)?;
+        Self::update_price_oracle(pool, new_price, 0)?; // Note: In production, use actual timestamp
+
+        Ok(output_amount)
+    }
+
+    /// Execute a flash loan
+    pub fn execute_flash_loan(
+        pool: &mut LiquidityPool,
+        token_account: &mut Account,
+        amount: u64,
+        is_token_a: bool,
+        callback: impl FnOnce(&mut Account) -> Result<(), ProgramError>,
+    ) -> Result<(), ProgramError> {
+        // Verify pool is active
+        if !pool.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Verify token account matches pool token
+        if is_token_a {
+            if token_account.mint != pool.token_a_mint {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        } else {
+            if token_account.mint != pool.token_b_mint {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+
+        // Check if amount is within limits
+        let max_amount = if is_token_a {
+            (pool.token_a_balance as u128)
+                .checked_mul(pool.max_flash_loan_percentage as u128)
+                .ok_or(ProgramError::ArithmeticOverflow)?
+                .checked_div(100)
+                .ok_or(ProgramError::ArithmeticOverflow)? as u64
+        } else {
+            (pool.token_b_balance as u128)
+                .checked_mul(pool.max_flash_loan_percentage as u128)
+                .ok_or(ProgramError::ArithmeticOverflow)?
+                .checked_div(100)
+                .ok_or(ProgramError::ArithmeticOverflow)? as u64
+        };
+
+        if amount > max_amount {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Calculate flash loan fee
+        let fee_amount = (amount as u128)
+            .checked_mul(pool.flash_loan_fee as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
+
+        // Transfer tokens to borrower
+        if is_token_a {
+            pool.token_a_balance = pool
+                .token_a_balance
+                .checked_sub(amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        } else {
+            pool.token_b_balance = pool
+                .token_b_balance
+                .checked_sub(amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
+
+        token_account.amount = token_account
+            .amount
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Execute callback
+        callback(token_account)?;
+
+        // Verify repayment with fee
+        let required_repayment = amount
+            .checked_add(fee_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        if token_account.amount < required_repayment {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Return tokens to pool with fee
+        token_account.amount = token_account
+            .amount
+            .checked_sub(required_repayment)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        if is_token_a {
+            pool.token_a_balance = pool
+                .token_a_balance
+                .checked_add(required_repayment)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        } else {
+            pool.token_b_balance = pool
+                .token_b_balance
+                .checked_add(required_repayment)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
+
+        Ok(())
+    }
+
+    /// Pause the liquidity pool
+    pub fn pause_pool(
+        pool: &mut LiquidityPool,
+        admin: &Pubkey,
+        current_time: i64,
+    ) -> Result<(), ProgramError> {
+        // Verify admin
+        if admin != &pool.emergency_pause.admin {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check if already paused
+        if pool.emergency_pause.is_paused {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Pause pool
+        pool.emergency_pause.is_paused = true;
+        pool.emergency_pause.pause_timestamp = current_time;
+        pool.is_active = false;
+
+        Ok(())
+    }
+
+    /// Unpause the liquidity pool
+    pub fn unpause_pool(
+        pool: &mut LiquidityPool,
+        admin: &Pubkey,
+        current_time: i64,
+    ) -> Result<(), ProgramError> {
+        // Verify admin
+        if admin != &pool.emergency_pause.admin {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check if paused
+        if !pool.emergency_pause.is_paused {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check pause duration
+        if current_time - pool.emergency_pause.pause_timestamp
+            > pool.emergency_pause.max_pause_duration
+        {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Unpause pool
+        pool.emergency_pause.is_paused = false;
+        pool.emergency_pause.pause_timestamp = 0;
+        pool.is_active = true;
+
+        Ok(())
+    }
+
+    /// Check if pool is paused
+    pub fn check_pause(pool: &LiquidityPool) -> Result<(), ProgramError> {
+        if pool.emergency_pause.is_paused {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    /// Initialize liquidity mining program
+    pub fn initialize_mining(
+        pool: &mut LiquidityPool,
+        total_rewards: u64,
+        start_time: i64,
+        duration_days: u64,
+        admin: &Pubkey,
+    ) -> Result<(), ProgramError> {
+        // Verify admin
+        if admin != &pool.emergency_pause.admin {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check if mining is already active
+        if pool.liquidity_mining.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Calculate end time and reward rate
+        let end_time = start_time + (duration_days * 86400) as i64;
+        let duration_seconds = (end_time - start_time) as u64;
+        let reward_rate = total_rewards / duration_seconds;
+
+        // Initialize mining program
+        pool.liquidity_mining = LiquidityMining {
+            total_rewards,
+            remaining_rewards: total_rewards,
+            start_time,
+            end_time,
+            reward_rate,
+            total_shares: 0,
+            is_active: true,
+        };
+
+        Ok(())
+    }
+
+    /// Add liquidity to the pool with mining rewards
     pub fn add_liquidity(
         pool: &mut LiquidityPool,
         token_a_account: &mut Account,
@@ -475,7 +910,140 @@ impl SharedLiquidityChecker {
             .checked_sub(token_b_amount)
             .ok_or(ProgramError::ArithmeticOverflow)?;
 
+        // Calculate and update liquidity shares
+        let total_value = (pool.token_a_balance as u128)
+            .checked_add(pool.token_b_balance as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let deposit_value = (token_a_amount as u128)
+            .checked_add(token_b_amount as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        let shares = if pool.liquidity_mining.total_shares == 0 {
+            deposit_value as u64
+        } else {
+            (deposit_value as u128)
+                .checked_mul(pool.liquidity_mining.total_shares as u128)
+                .ok_or(ProgramError::ArithmeticOverflow)?
+                .checked_div(total_value)
+                .ok_or(ProgramError::ArithmeticOverflow)? as u64
+        };
+
+        // Update provider's position
+        let position = pool
+            .positions
+            .entry(token_a_account.owner)
+            .or_insert(LiquidityPosition {
+                shares: 0,
+                last_claim_time: 0,
+                accumulated_rewards: 0,
+            });
+
+        position.shares = position
+            .shares
+            .checked_add(shares)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Update total shares
+        pool.liquidity_mining.total_shares = pool
+            .liquidity_mining
+            .total_shares
+            .checked_add(shares)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
         Ok(())
+    }
+
+    /// Claim mining rewards
+    pub fn claim_rewards(
+        pool: &mut LiquidityPool,
+        provider: &Pubkey,
+        current_time: i64,
+    ) -> Result<u64, ProgramError> {
+        // Check if mining is active
+        if !pool.liquidity_mining.is_active {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Check if mining period has ended
+        if current_time > pool.liquidity_mining.end_time {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Get provider's position
+        let position = pool
+            .positions
+            .get_mut(provider)
+            .ok_or(ProgramError::InvalidAccountData)?;
+
+        // Calculate rewards
+        let time_elapsed = current_time - position.last_claim_time;
+        let reward_per_share = (pool.liquidity_mining.reward_rate as u128)
+            .checked_mul(time_elapsed as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(pool.liquidity_mining.total_shares as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
+
+        let rewards = (position.shares as u128)
+            .checked_mul(reward_per_share as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
+
+        // Update position
+        position.last_claim_time = current_time;
+        position.accumulated_rewards = position
+            .accumulated_rewards
+            .checked_add(rewards)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Update remaining rewards
+        pool.liquidity_mining.remaining_rewards = pool
+            .liquidity_mining
+            .remaining_rewards
+            .checked_sub(rewards)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        Ok(rewards)
+    }
+
+    /// Calculate swap amount using constant product formula
+    pub fn calculate_swap_amount(
+        pool: &LiquidityPool,
+        input_amount: u64,
+        is_token_a_to_b: bool,
+    ) -> Result<u64, ProgramError> {
+        // Check if pool has sufficient liquidity
+        if pool.token_a_balance == 0 || pool.token_b_balance == 0 {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        // Calculate fee
+        let fee_amount = (input_amount as u128)
+            .checked_mul(pool.fee_rate as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
+
+        let input_amount_after_fee = input_amount
+            .checked_sub(fee_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Calculate output amount using constant product formula
+        let (reserve_in, reserve_out) = if is_token_a_to_b {
+            (pool.token_a_balance, pool.token_b_balance)
+        } else {
+            (pool.token_b_balance, pool.token_a_balance)
+        };
+
+        let output_amount = (input_amount_after_fee as u128)
+            .checked_mul(reserve_out as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(
+                (reserve_in as u128)
+                    .checked_add(input_amount_after_fee as u128)
+                    .ok_or(ProgramError::ArithmeticOverflow)?,
+            )
+            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
+
+        Ok(output_amount)
     }
 
     /// Remove liquidity from the pool
@@ -501,15 +1069,6 @@ impl SharedLiquidityChecker {
             return Err(ProgramError::InsufficientFunds);
         }
 
-        // Calculate price impact
-        let price_impact = (token_a_amount as f64 * token_b_amount as f64)
-            / (pool.token_a_balance as f64 * pool.token_b_balance as f64);
-
-        // Limit price impact to 5%
-        if price_impact > 0.05 {
-            return Err(ProgramError::InvalidArgument);
-        }
-
         // Update pool balances
         pool.token_a_balance = pool
             .token_a_balance
@@ -520,7 +1079,7 @@ impl SharedLiquidityChecker {
             .checked_sub(token_b_amount)
             .ok_or(ProgramError::ArithmeticOverflow)?;
 
-        // Transfer tokens from pool
+        // Transfer tokens to accounts
         token_a_account.amount = token_a_account
             .amount
             .checked_add(token_a_amount)
@@ -531,132 +1090,6 @@ impl SharedLiquidityChecker {
             .ok_or(ProgramError::ArithmeticOverflow)?;
 
         Ok(())
-    }
-
-    /// Calculate swap amount using constant product formula (x * y = k)
-    pub fn calculate_swap_amount(
-        pool: &LiquidityPool,
-        input_amount: u64,
-        is_token_a_to_b: bool,
-    ) -> Result<u64, ProgramError> {
-        // Verify pool is active
-        if !pool.is_active {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        let (input_balance, output_balance) = if is_token_a_to_b {
-            (pool.token_a_balance, pool.token_b_balance)
-        } else {
-            (pool.token_b_balance, pool.token_a_balance)
-        };
-
-        // Ensure sufficient liquidity
-        if input_balance == 0 || output_balance == 0 {
-            return Err(ProgramError::InsufficientFunds);
-        }
-
-        // Calculate fee (in basis points)
-        let fee_amount = (input_amount as u128)
-            .checked_mul(pool.fee_rate as u128)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_div(10000)
-            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
-
-        let input_amount_after_fee = input_amount
-            .checked_sub(fee_amount)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-
-        // Calculate output amount using constant product formula
-        // (x + Δx)(y - Δy) = xy
-        // Δy = (y * Δx) / (x + Δx)
-        let output_amount = (output_balance as u128)
-            .checked_mul(input_amount_after_fee as u128)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_div(
-                (input_balance as u128)
-                    .checked_add(input_amount_after_fee as u128)
-                    .ok_or(ProgramError::ArithmeticOverflow)?,
-            )
-            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
-
-        // Calculate price impact
-        let price_impact = (input_amount_after_fee as f64 * output_amount as f64)
-            / (input_balance as f64 * output_balance as f64);
-
-        // Limit price impact to 5%
-        if price_impact > 0.05 {
-            return Err(ProgramError::InvalidArgument);
-        }
-
-        // Apply slippage protection (0.1%)
-        let min_output = (output_amount as u128)
-            .checked_mul(999)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_div(1000)
-            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
-
-        Ok(min_output)
-    }
-
-    /// Execute a token swap in the pool
-    pub fn execute_swap(
-        pool: &mut LiquidityPool,
-        input_account: &mut Account,
-        output_account: &mut Account,
-        input_amount: u64,
-        is_token_a_to_b: bool,
-    ) -> Result<u64, ProgramError> {
-        // Calculate output amount
-        let output_amount = Self::calculate_swap_amount(pool, input_amount, is_token_a_to_b)?;
-
-        // Verify token accounts match pool tokens
-        if is_token_a_to_b {
-            if input_account.mint != pool.token_a_mint || output_account.mint != pool.token_b_mint {
-                return Err(ProgramError::InvalidAccountData);
-            }
-        } else {
-            if input_account.mint != pool.token_b_mint || output_account.mint != pool.token_a_mint {
-                return Err(ProgramError::InvalidAccountData);
-            }
-        }
-
-        // Check if input account has enough balance
-        if input_account.amount < input_amount {
-            return Err(ProgramError::InsufficientFunds);
-        }
-
-        // Update pool balances
-        if is_token_a_to_b {
-            pool.token_a_balance = pool
-                .token_a_balance
-                .checked_add(input_amount)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            pool.token_b_balance = pool
-                .token_b_balance
-                .checked_sub(output_amount)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-        } else {
-            pool.token_b_balance = pool
-                .token_b_balance
-                .checked_add(input_amount)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            pool.token_a_balance = pool
-                .token_a_balance
-                .checked_sub(output_amount)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-        }
-
-        // Update account balances
-        input_account.amount = input_account
-            .amount
-            .checked_sub(input_amount)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        output_account.amount = output_account
-            .amount
-            .checked_add(output_amount)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-
-        Ok(output_amount)
     }
 }
 
@@ -930,12 +1363,14 @@ mod tests {
     fn test_liquidity_pool() {
         let token_a_mint = Pubkey::new_unique();
         let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
 
         // Create liquidity pool
         let mut pool = SharedLiquidityChecker::create_liquidity_pool(
             token_a_mint,
             token_b_mint,
             30, // 0.3% fee
+            admin,
         )
         .unwrap();
 
@@ -1005,21 +1440,14 @@ mod tests {
 
     #[test]
     fn test_liquidity_pool_optimized() {
-        // Tests:
-        // 1. Initial liquidity provision (500,000 tokens each)
-        // 2. Small swap (1,000 tokens) - should succeed
-        // 3. Large swap (200,000 tokens) - should fail due to price impact
-        // 4. Fee calculation verification (0.3% of 1000 = 3)
-        // 5. Slippage protection verification
-        // 6. Liquidity removal
-        // 7. Final balance verification
-
         let token_a_mint = Pubkey::new_unique();
         let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
 
         // Create liquidity pool with 0.3% fee
         let mut pool =
-            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
 
         let mut token_a_account = Account {
             mint: token_a_mint,
@@ -1109,17 +1537,13 @@ mod tests {
 
     #[test]
     fn test_liquidity_pool_edge_cases() {
-        // Tests:
-        // 1. Creating pool with same token - should fail
-        // 2. Creating pool with invalid fee (2%) - should fail
-        // 3. Adding liquidity with zero amounts - should fail
-        // 4. Swapping with insufficient liquidity - should fail
         let token_a_mint = Pubkey::new_unique();
         let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
 
         // Test creating pool with same token
         let same_token_result =
-            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_a_mint, 30);
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_a_mint, 30, admin);
         assert!(same_token_result.is_err());
 
         // Test creating pool with invalid fee
@@ -1127,12 +1551,14 @@ mod tests {
             token_a_mint,
             token_b_mint,
             200, // 2% fee (invalid)
+            admin,
         );
         assert!(invalid_fee_result.is_err());
 
         // Create valid pool
         let mut pool =
-            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
 
         // Test adding liquidity with zero amounts
         let mut token_a_account = Account {
@@ -1181,10 +1607,12 @@ mod tests {
     fn test_consecutive_swaps() {
         let token_a_mint = Pubkey::new_unique();
         let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
 
         // Create liquidity pool with 0.3% fee
         let mut pool =
-            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
 
         let mut token_a_account = Account {
             mint: token_a_mint,
@@ -1259,10 +1687,12 @@ mod tests {
     fn test_fee_collection() {
         let token_a_mint = Pubkey::new_unique();
         let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
 
         // Create liquidity pool with 0.3% fee
         let mut pool =
-            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
 
         let mut token_a_account = Account {
             mint: token_a_mint,
@@ -1331,10 +1761,12 @@ mod tests {
     fn test_slippage_protection() {
         let token_a_mint = Pubkey::new_unique();
         let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
 
         // Create liquidity pool with 0.3% fee
         let mut pool =
-            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
 
         let mut token_a_account = Account {
             mint: token_a_mint,
@@ -1401,5 +1833,243 @@ mod tests {
             let slippage = (expected_output - actual_output) as f64 / expected_output as f64;
             assert!(slippage <= 0.001); // 0.1% maximum slippage
         }
+    }
+
+    #[test]
+    fn test_flash_loan() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+
+        // Create liquidity pool with 0.3% fee
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
+
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 0,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Add initial liquidity
+        let mut provider_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut provider_account,
+            &mut token_a_account,
+            500_000,
+            0
+        )
+        .is_ok());
+
+        // Test successful flash loan
+        let flash_loan_amount = 100_000;
+        let result = SharedLiquidityChecker::execute_flash_loan(
+            &mut pool,
+            &mut token_a_account,
+            flash_loan_amount,
+            true,
+            |account| {
+                // Simulate using the flash loan
+                account.amount = account
+                    .amount
+                    .checked_add(1_000)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+
+        // Test flash loan exceeding max amount
+        let max_amount = (pool.token_a_balance as u128)
+            .checked_mul(pool.max_flash_loan_percentage as u128)
+            .unwrap()
+            .checked_div(100)
+            .unwrap() as u64;
+        let result = SharedLiquidityChecker::execute_flash_loan(
+            &mut pool,
+            &mut token_a_account,
+            max_amount + 1,
+            true,
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+
+        // Test flash loan with insufficient repayment
+        let result = SharedLiquidityChecker::execute_flash_loan(
+            &mut pool,
+            &mut token_a_account,
+            flash_loan_amount,
+            true,
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_price_oracle() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+
+        // Create liquidity pool
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
+
+        // Test initial price update
+        assert!(SharedLiquidityChecker::update_price_oracle(&mut pool, 1.0, 100).is_ok());
+        assert_eq!(pool.price_oracle.last_price, 1.0);
+        assert_eq!(pool.price_oracle.last_update, 100);
+
+        // Test update interval
+        assert!(SharedLiquidityChecker::update_price_oracle(&mut pool, 1.1, 150).is_err());
+
+        // Test price deviation
+        assert!(SharedLiquidityChecker::update_price_oracle(&mut pool, 2.0, 200).is_err());
+
+        // Test valid price update
+        assert!(SharedLiquidityChecker::update_price_oracle(&mut pool, 1.01, 200).is_ok());
+
+        // Test price validation
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Add initial liquidity
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            500_000,
+            500_000
+        )
+        .is_ok());
+
+        // Test price calculation
+        let price = SharedLiquidityChecker::calculate_pool_price(&pool).unwrap();
+        assert_eq!(price, 1.0);
+
+        // Test price validation
+        assert!(SharedLiquidityChecker::validate_price(&pool).is_ok());
+
+        // Test swap with price validation
+        let result = SharedLiquidityChecker::execute_swap(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            1_000,
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_liquidity_mining() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let provider = Pubkey::new_unique();
+
+        // Create liquidity pool
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
+
+        // Initialize mining program
+        assert!(SharedLiquidityChecker::initialize_mining(
+            &mut pool, 1_000_000, // 1M rewards
+            100,       // Start time
+            30,        // 30 days duration
+            &admin
+        )
+        .is_ok());
+
+        // Add liquidity
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: provider,
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: provider,
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            500_000,
+            500_000
+        )
+        .is_ok());
+
+        // Claim rewards after 1 day
+        let rewards =
+            SharedLiquidityChecker::claim_rewards(&mut pool, &provider, 100 + 86400).unwrap();
+        assert!(rewards > 0);
+
+        // Verify position updated
+        let position = pool.positions.get(&provider).unwrap();
+        assert_eq!(position.accumulated_rewards, rewards);
+        assert_eq!(position.last_claim_time, 100 + 86400);
+
+        // Verify remaining rewards updated
+        assert_eq!(
+            pool.liquidity_mining.remaining_rewards,
+            pool.liquidity_mining.total_rewards - rewards
+        );
+
+        // Test claiming after mining period
+        let end_time = pool.liquidity_mining.end_time;
+        let result = SharedLiquidityChecker::claim_rewards(&mut pool, &provider, end_time + 1);
+        assert!(result.is_err());
     }
 }

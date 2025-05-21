@@ -1176,4 +1176,230 @@ mod tests {
         );
         assert!(insufficient_liquidity_result.is_err());
     }
+
+    #[test]
+    fn test_consecutive_swaps() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+
+        // Create liquidity pool with 0.3% fee
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Add initial liquidity
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            500_000,
+            500_000
+        )
+        .is_ok());
+
+        // Perform multiple swaps in sequence
+        let swap_amounts = [1_000, 2_000, 5_000, 10_000];
+        let mut total_output = 0;
+
+        for amount in swap_amounts.iter() {
+            let output = SharedLiquidityChecker::execute_swap(
+                &mut pool,
+                &mut token_a_account,
+                &mut token_b_account,
+                *amount,
+                true,
+            )
+            .unwrap();
+            total_output += output;
+        }
+
+        // Verify that each swap had increasing price impact
+        let mut last_price_impact = 0.0;
+        for amount in swap_amounts.iter() {
+            let output =
+                SharedLiquidityChecker::calculate_swap_amount(&pool, *amount, true).unwrap();
+            let price_impact = (*amount as f64 * output as f64)
+                / (pool.token_a_balance as f64 * pool.token_b_balance as f64);
+            assert!(price_impact > last_price_impact);
+            last_price_impact = price_impact;
+        }
+
+        // Verify total output is less than what would be expected from a single large swap
+        let single_swap_output = SharedLiquidityChecker::calculate_swap_amount(
+            &pool,
+            swap_amounts.iter().sum::<u64>(),
+            true,
+        )
+        .unwrap();
+        assert!(total_output > single_swap_output);
+    }
+
+    #[test]
+    fn test_fee_collection() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+
+        // Create liquidity pool with 0.3% fee
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Add initial liquidity
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            500_000,
+            500_000
+        )
+        .is_ok());
+
+        // Record initial balances
+        let initial_a_balance = pool.token_a_balance;
+        let initial_b_balance = pool.token_b_balance;
+
+        // Perform a swap
+        let swap_amount = 10_000;
+        let output = SharedLiquidityChecker::execute_swap(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            swap_amount,
+            true,
+        )
+        .unwrap();
+
+        // Calculate expected fee
+        let expected_fee = (swap_amount as u128)
+            .checked_mul(pool.fee_rate as u128)
+            .unwrap()
+            .checked_div(10000)
+            .unwrap() as u64;
+
+        // Verify fee was collected
+        assert_eq!(pool.token_a_balance, initial_a_balance + swap_amount);
+        assert_eq!(pool.token_b_balance, initial_b_balance - output);
+
+        // Verify fee amount
+        let actual_fee = swap_amount - (swap_amount - expected_fee);
+        assert_eq!(actual_fee, expected_fee);
+    }
+
+    #[test]
+    fn test_slippage_protection() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+
+        // Create liquidity pool with 0.3% fee
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30).unwrap();
+
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Add initial liquidity
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            500_000,
+            500_000
+        )
+        .is_ok());
+
+        // Test different swap sizes
+        let swap_sizes = [1_000, 10_000, 50_000, 100_000];
+
+        for size in swap_sizes.iter() {
+            // Calculate expected output with slippage protection
+            let expected_output =
+                SharedLiquidityChecker::calculate_swap_amount(&pool, *size, true).unwrap();
+
+            // Calculate minimum output with 0.1% slippage
+            let min_output = (expected_output as u128)
+                .checked_mul(999)
+                .unwrap()
+                .checked_div(1000)
+                .unwrap() as u64;
+
+            // Execute swap
+            let actual_output = SharedLiquidityChecker::execute_swap(
+                &mut pool,
+                &mut token_a_account,
+                &mut token_b_account,
+                *size,
+                true,
+            )
+            .unwrap();
+
+            // Verify output is within slippage bounds
+            assert!(actual_output >= min_output);
+            assert!(actual_output <= expected_output);
+
+            // Verify slippage percentage
+            let slippage = (expected_output - actual_output) as f64 / expected_output as f64;
+            assert!(slippage <= 0.001); // 0.1% maximum slippage
+        }
+    }
 }

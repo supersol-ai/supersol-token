@@ -2072,4 +2072,377 @@ mod tests {
         let result = SharedLiquidityChecker::claim_rewards(&mut pool, &provider, end_time + 1);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_emergency_pause_comprehensive() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let non_admin = Pubkey::new_unique();
+
+        // Create liquidity pool
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
+
+        // Test 1: Non-admin cannot pause pool
+        let result = SharedLiquidityChecker::pause_pool(&mut pool, &non_admin, 100);
+        assert!(result.is_err());
+
+        // Test 2: Admin can pause pool
+        assert!(SharedLiquidityChecker::pause_pool(&mut pool, &admin, 100).is_ok());
+        assert!(pool.emergency_pause.is_paused);
+        assert_eq!(pool.emergency_pause.pause_timestamp, 100);
+        assert!(!pool.is_active);
+
+        // Test 3: Cannot pause already paused pool
+        let result = SharedLiquidityChecker::pause_pool(&mut pool, &admin, 200);
+        assert!(result.is_err());
+
+        // Test 4: Non-admin cannot unpause pool
+        let result = SharedLiquidityChecker::unpause_pool(&mut pool, &non_admin, 200);
+        assert!(result.is_err());
+
+        // Test 5: Admin can unpause pool within max duration
+        assert!(SharedLiquidityChecker::unpause_pool(&mut pool, &admin, 200).is_ok());
+        assert!(!pool.emergency_pause.is_paused);
+        assert_eq!(pool.emergency_pause.pause_timestamp, 0);
+        assert!(pool.is_active);
+
+        // Test 6: Cannot unpause already unpaused pool
+        let result = SharedLiquidityChecker::unpause_pool(&mut pool, &admin, 300);
+        assert!(result.is_err());
+
+        // Test 7: Pause and try to unpause after max duration
+        assert!(SharedLiquidityChecker::pause_pool(&mut pool, &admin, 400).is_ok());
+        let result = SharedLiquidityChecker::unpause_pool(
+            &mut pool,
+            &admin,
+            400 + pool.emergency_pause.max_pause_duration + 1,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_emergency_pause_operations() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+
+        // Create liquidity pool
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
+
+        // Setup accounts for testing
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        // Add initial liquidity
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            500_000,
+            500_000
+        )
+        .is_ok());
+
+        // Test 1: Pause pool and verify all operations are blocked
+        assert!(SharedLiquidityChecker::pause_pool(&mut pool, &admin, 100).is_ok());
+
+        // Verify swap is blocked
+        let swap_result = SharedLiquidityChecker::execute_swap(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            1_000,
+            true,
+        );
+        assert!(swap_result.is_err());
+
+        // Verify flash loan is blocked
+        let flash_loan_result = SharedLiquidityChecker::execute_flash_loan(
+            &mut pool,
+            &mut token_a_account,
+            10_000,
+            true,
+            |_| Ok(()),
+        );
+        assert!(flash_loan_result.is_err());
+
+        // Verify add liquidity is blocked
+        let add_liquidity_result = SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            1_000,
+            1_000,
+        );
+        assert!(add_liquidity_result.is_err());
+
+        // Test 2: Unpause pool and verify operations resume
+        assert!(SharedLiquidityChecker::unpause_pool(&mut pool, &admin, 200).is_ok());
+
+        // Verify swap works again
+        let swap_result = SharedLiquidityChecker::execute_swap(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            1_000,
+            true,
+        );
+        assert!(swap_result.is_ok());
+    }
+
+    #[test]
+    fn test_liquidity_mining_comprehensive() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let provider1 = Pubkey::new_unique();
+        let provider2 = Pubkey::new_unique();
+
+        // Create liquidity pool
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
+
+        // Test 1: Initialize mining program
+        let total_rewards = 1_000_000;
+        let start_time = 100;
+        let duration_days = 30;
+        assert!(SharedLiquidityChecker::initialize_mining(
+            &mut pool,
+            total_rewards,
+            start_time,
+            duration_days,
+            &admin
+        )
+        .is_ok());
+
+        // Verify mining program state
+        assert!(pool.liquidity_mining.is_active);
+        assert_eq!(pool.liquidity_mining.total_rewards, total_rewards);
+        assert_eq!(pool.liquidity_mining.remaining_rewards, total_rewards);
+        assert_eq!(pool.liquidity_mining.start_time, start_time);
+        assert_eq!(
+            pool.liquidity_mining.end_time,
+            start_time + (duration_days * 86400) as i64
+        );
+
+        // Test 2: Add liquidity from first provider
+        let mut token_a_account1 = Account {
+            mint: token_a_mint,
+            owner: provider1,
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account1 = Account {
+            mint: token_b_mint,
+            owner: provider1,
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account1,
+            &mut token_b_account1,
+            500_000,
+            500_000
+        )
+        .is_ok());
+
+        // Test 3: Add liquidity from second provider
+        let mut token_a_account2 = Account {
+            mint: token_a_mint,
+            owner: provider2,
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account2 = Account {
+            mint: token_b_mint,
+            owner: provider2,
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account2,
+            &mut token_b_account2,
+            250_000,
+            250_000
+        )
+        .is_ok());
+
+        // Test 4: Claim rewards for first provider after 1 day
+        let rewards1 =
+            SharedLiquidityChecker::claim_rewards(&mut pool, &provider1, start_time + 86400)
+                .unwrap();
+        assert!(rewards1 > 0);
+
+        // Test 5: Claim rewards for second provider after 2 days
+        let rewards2 =
+            SharedLiquidityChecker::claim_rewards(&mut pool, &provider2, start_time + 172800)
+                .unwrap();
+        assert!(rewards2 > 0);
+
+        // Verify rewards are proportional to shares
+        let position1 = pool.positions.get(&provider1).unwrap();
+        let position2 = pool.positions.get(&provider2).unwrap();
+        assert!(position1.accumulated_rewards > position2.accumulated_rewards);
+
+        // Test 6: Try to claim rewards before start time
+        let result = SharedLiquidityChecker::claim_rewards(&mut pool, &provider1, start_time - 1);
+        assert!(result.is_err());
+
+        // Test 7: Try to claim rewards after end time
+        let result = SharedLiquidityChecker::claim_rewards(
+            &mut pool,
+            &provider1,
+            pool.liquidity_mining.end_time + 1,
+        );
+        assert!(result.is_err());
+
+        // Test 8: Verify remaining rewards
+        assert_eq!(
+            pool.liquidity_mining.remaining_rewards,
+            total_rewards - position1.accumulated_rewards - position2.accumulated_rewards
+        );
+    }
+
+    #[test]
+    fn test_liquidity_mining_edge_cases() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let provider = Pubkey::new_unique();
+
+        // Create liquidity pool
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
+
+        // Test 1: Initialize mining with zero rewards
+        let result = SharedLiquidityChecker::initialize_mining(&mut pool, 0, 100, 30, &admin);
+        assert!(result.is_err());
+
+        // Test 2: Initialize mining with zero duration
+        let result =
+            SharedLiquidityChecker::initialize_mining(&mut pool, 1_000_000, 100, 0, &admin);
+        assert!(result.is_err());
+
+        // Test 3: Initialize mining with non-admin
+        let non_admin = Pubkey::new_unique();
+        let result =
+            SharedLiquidityChecker::initialize_mining(&mut pool, 1_000_000, 100, 30, &non_admin);
+        assert!(result.is_err());
+
+        // Initialize valid mining program
+        assert!(
+            SharedLiquidityChecker::initialize_mining(&mut pool, 1_000_000, 100, 30, &admin)
+                .is_ok()
+        );
+
+        // Test 4: Add zero liquidity
+        let mut token_a_account = Account {
+            mint: token_a_mint,
+            owner: provider,
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_b_account = Account {
+            mint: token_b_mint,
+            owner: provider,
+            amount: 1_000_000,
+            delegate: COption::None,
+            state: crate::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let result = SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            0,
+            0,
+        );
+        assert!(result.is_err());
+
+        // Test 5: Add liquidity with mismatched amounts
+        let result = SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            1_000,
+            2_000,
+        );
+        assert!(result.is_err());
+
+        // Add valid liquidity
+        assert!(SharedLiquidityChecker::add_liquidity(
+            &mut pool,
+            &mut token_a_account,
+            &mut token_b_account,
+            500_000,
+            500_000
+        )
+        .is_ok());
+
+        // Test 6: Claim rewards for non-existent provider
+        let non_provider = Pubkey::new_unique();
+        let result = SharedLiquidityChecker::claim_rewards(&mut pool, &non_provider, 200);
+        assert!(result.is_err());
+
+        // Test 7: Claim rewards multiple times in same block
+        let rewards1 = SharedLiquidityChecker::claim_rewards(&mut pool, &provider, 200).unwrap();
+        let rewards2 = SharedLiquidityChecker::claim_rewards(&mut pool, &provider, 200).unwrap();
+        assert_eq!(rewards2, 0); // Should get zero rewards for same timestamp
+    }
 }

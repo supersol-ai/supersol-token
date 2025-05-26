@@ -13,6 +13,15 @@ pub const MIN_SHARED_LIQUIDITY_SUPPLY: u64 = 1_000_000; // 1M tokens minimum
 /// Maximum supply allowed for shared liquidity tokens
 pub const MAX_SHARED_LIQUIDITY_SUPPLY: u64 = 1_000_000_000_000; // 1T tokens maximum
 
+/// Maximum number of ranges per position
+pub const MAX_RANGES_PER_POSITION: u8 = 10;
+
+/// Minimum range width in basis points (0.01%)
+pub const MIN_RANGE_WIDTH: u32 = 1;
+
+/// Maximum range width in basis points (100%)
+pub const MAX_RANGE_WIDTH: u32 = 10000;
+
 /// Shared liquidity compatibility check result
 #[derive(Debug, PartialEq)]
 pub enum SharedLiquidityCompatibility {
@@ -120,6 +129,36 @@ pub struct LiquidityPosition {
     pub accumulated_rewards: u64,
 }
 
+/// Concentrated liquidity range
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiquidityRange {
+    /// Lower price bound in basis points
+    pub lower_price: u32,
+    /// Upper price bound in basis points
+    pub upper_price: u32,
+    /// Liquidity amount in this range
+    pub liquidity: u64,
+    /// Fees collected in this range
+    pub fees_collected: u64,
+    /// Last update timestamp
+    pub last_update: i64,
+}
+
+/// Enhanced liquidity position with ranges
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnhancedLiquidityPosition {
+    /// Base position data
+    pub base_position: LiquidityPosition,
+    /// Active liquidity ranges
+    pub ranges: Vec<LiquidityRange>,
+    /// Position ID
+    pub position_id: u64,
+    /// Creation timestamp
+    pub created_at: i64,
+    /// Last update timestamp
+    pub updated_at: i64,
+}
+
 /// Liquidity pool configuration for shared liquidity tokens
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiquidityPool {
@@ -147,6 +186,14 @@ pub struct LiquidityPool {
     pub liquidity_mining: LiquidityMining,
     /// Liquidity provider positions
     pub positions: std::collections::HashMap<Pubkey, LiquidityPosition>,
+    /// Enhanced liquidity positions
+    pub enhanced_positions: std::collections::HashMap<u64, EnhancedLiquidityPosition>,
+    /// Next position ID
+    pub next_position_id: u64,
+    /// Current price in basis points
+    pub current_price: u32,
+    /// Price history for range calculations
+    pub price_history: Vec<(i64, u32)>,
 }
 
 /// Emergency pause configuration
@@ -164,6 +211,17 @@ pub struct EmergencyPause {
 
 /// Enhanced shared liquidity compatibility checks and token exchange functionality
 pub struct SharedLiquidityChecker;
+
+// Multi-hop swap constants
+pub const MAX_HOPS: usize = 5;
+pub const MIN_OUTPUT_AMOUNT_THRESHOLD: u64 = 100; // Minimum output amount to consider a path
+
+#[derive(Debug, Clone)]
+pub struct SwapPath {
+    pub pools: Vec<Pubkey>,
+    pub expected_output: u64,
+    pub price_impact: u64,
+}
 
 impl SharedLiquidityChecker {
     /// Check if a mint is compatible with shared liquidity
@@ -506,6 +564,10 @@ impl SharedLiquidityChecker {
                 is_active: false,
             },
             positions: std::collections::HashMap::new(),
+            enhanced_positions: std::collections::HashMap::new(),
+            next_position_id: 1,
+            current_price: 10000,
+            price_history: Vec::new(),
         })
     }
 
@@ -1090,6 +1152,460 @@ impl SharedLiquidityChecker {
             .ok_or(ProgramError::ArithmeticOverflow)?;
 
         Ok(())
+    }
+
+    /// Create a new concentrated liquidity position
+    pub fn create_concentrated_position(
+        pool: &mut LiquidityPool,
+        provider: &Pubkey,
+        token_a_amount: u64,
+        token_b_amount: u64,
+        lower_price: u32,
+        upper_price: u32,
+        current_time: i64,
+    ) -> Result<u64, ProgramError> {
+        // Validate price range
+        if lower_price >= upper_price {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let range_width = upper_price - lower_price;
+        if range_width < MIN_RANGE_WIDTH || range_width > MAX_RANGE_WIDTH {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Calculate liquidity for the range
+        let liquidity = Self::calculate_range_liquidity(
+            token_a_amount,
+            token_b_amount,
+            lower_price,
+            upper_price,
+            pool.current_price,
+        )?;
+
+        // Create new position
+        let position_id = pool.next_position_id;
+        pool.next_position_id = pool
+            .next_position_id
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        let range = LiquidityRange {
+            lower_price,
+            upper_price,
+            liquidity,
+            fees_collected: 0,
+            last_update: current_time,
+        };
+
+        let enhanced_position = EnhancedLiquidityPosition {
+            base_position: LiquidityPosition {
+                shares: 0,
+                last_claim_time: current_time,
+                accumulated_rewards: 0,
+            },
+            ranges: vec![range],
+            position_id,
+            created_at: current_time,
+            updated_at: current_time,
+        };
+
+        pool.enhanced_positions
+            .insert(position_id, enhanced_position);
+
+        Ok(position_id)
+    }
+
+    /// Add a new range to an existing position
+    pub fn add_range_to_position(
+        pool: &mut LiquidityPool,
+        position_id: u64,
+        token_a_amount: u64,
+        token_b_amount: u64,
+        lower_price: u32,
+        upper_price: u32,
+        current_time: i64,
+    ) -> Result<(), ProgramError> {
+        let position = pool
+            .enhanced_positions
+            .get_mut(&position_id)
+            .ok_or(ProgramError::InvalidAccountData)?;
+
+        // Check range limit
+        if position.ranges.len() >= MAX_RANGES_PER_POSITION as usize {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Validate price range
+        if lower_price >= upper_price {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let range_width = upper_price - lower_price;
+        if range_width < MIN_RANGE_WIDTH || range_width > MAX_RANGE_WIDTH {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Calculate liquidity for the range
+        let liquidity = Self::calculate_range_liquidity(
+            token_a_amount,
+            token_b_amount,
+            lower_price,
+            upper_price,
+            pool.current_price,
+        )?;
+
+        let range = LiquidityRange {
+            lower_price,
+            upper_price,
+            liquidity,
+            fees_collected: 0,
+            last_update: current_time,
+        };
+
+        position.ranges.push(range);
+        position.updated_at = current_time;
+
+        Ok(())
+    }
+
+    /// Remove a range from a position
+    pub fn remove_range_from_position(
+        pool: &mut LiquidityPool,
+        position_id: u64,
+        range_index: usize,
+        current_time: i64,
+    ) -> Result<(u64, u64), ProgramError> {
+        let position = pool
+            .enhanced_positions
+            .get_mut(&position_id)
+            .ok_or(ProgramError::InvalidAccountData)?;
+
+        if range_index >= position.ranges.len() {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let range = position.ranges.remove(range_index);
+        position.updated_at = current_time;
+
+        // Calculate token amounts to return
+        let (token_a_amount, token_b_amount) = Self::calculate_range_token_amounts(
+            range.liquidity,
+            range.lower_price,
+            range.upper_price,
+            pool.current_price,
+        )?;
+
+        Ok((token_a_amount, token_b_amount))
+    }
+
+    /// Calculate liquidity for a given range
+    fn calculate_range_liquidity(
+        token_a_amount: u64,
+        token_b_amount: u64,
+        lower_price: u32,
+        upper_price: u32,
+        current_price: u32,
+    ) -> Result<u64, ProgramError> {
+        // Calculate liquidity based on token amounts and price range
+        let sqrt_lower = (lower_price as f64).sqrt();
+        let sqrt_upper = (upper_price as f64).sqrt();
+        let sqrt_current = (current_price as f64).sqrt();
+
+        let liquidity_a = (token_a_amount as f64) / (sqrt_upper - sqrt_current);
+        let liquidity_b = (token_b_amount as f64) / (sqrt_current - sqrt_lower);
+
+        // Use the minimum of both to ensure balanced liquidity
+        let liquidity = liquidity_a.min(liquidity_b) as u64;
+
+        Ok(liquidity)
+    }
+
+    /// Calculate token amounts for a given range
+    fn calculate_range_token_amounts(
+        liquidity: u64,
+        lower_price: u32,
+        upper_price: u32,
+        current_price: u32,
+    ) -> Result<(u64, u64), ProgramError> {
+        let sqrt_lower = (lower_price as f64).sqrt();
+        let sqrt_upper = (upper_price as f64).sqrt();
+        let sqrt_current = (current_price as f64).sqrt();
+
+        let token_a_amount = (liquidity as f64 * (sqrt_upper - sqrt_current)) as u64;
+        let token_b_amount = (liquidity as f64 * (sqrt_current - sqrt_lower)) as u64;
+
+        Ok((token_a_amount, token_b_amount))
+    }
+
+    /// Update position fees for a swap
+    pub fn update_position_fees(
+        pool: &mut LiquidityPool,
+        input_amount: u64,
+        output_amount: u64,
+        current_time: i64,
+    ) -> Result<(), ProgramError> {
+        let fee_amount = (input_amount as u128)
+            .checked_mul(pool.fee_rate as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ProgramError::ArithmeticOverflow)? as u64;
+
+        // Distribute fees to active ranges
+        for position in pool.enhanced_positions.values_mut() {
+            for range in &mut position.ranges {
+                if pool.current_price >= range.lower_price
+                    && pool.current_price <= range.upper_price
+                {
+                    // Calculate fee share based on liquidity
+                    let fee_share = (fee_amount as u128)
+                        .checked_mul(range.liquidity as u128)
+                        .ok_or(ProgramError::ArithmeticOverflow)?
+                        .checked_div(pool.token_a_balance as u128)
+                        .ok_or(ProgramError::ArithmeticOverflow)?
+                        as u64;
+
+                    range.fees_collected = range
+                        .fees_collected
+                        .checked_add(fee_share)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    range.last_update = current_time;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Collect fees from a position
+    pub fn collect_position_fees(
+        pool: &mut LiquidityPool,
+        position_id: u64,
+    ) -> Result<u64, ProgramError> {
+        let position = pool
+            .enhanced_positions
+            .get_mut(&position_id)
+            .ok_or(ProgramError::InvalidAccountData)?;
+
+        let total_fees = position
+            .ranges
+            .iter()
+            .map(|range| range.fees_collected)
+            .sum();
+
+        // Reset collected fees
+        for range in &mut position.ranges {
+            range.fees_collected = 0;
+        }
+
+        Ok(total_fees)
+    }
+
+    pub fn find_best_swap_path(
+        &self,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        input_amount: u64,
+        pools: &[LiquidityPool],
+        max_hops: Option<usize>,
+    ) -> Result<SwapPath, ProgramError> {
+        let max_hops = max_hops.unwrap_or(MAX_HOPS);
+        let mut best_path = None;
+        let mut best_output = 0;
+
+        // Find all possible paths
+        let paths =
+            self.find_all_paths(input_token, output_token, input_amount, pools, max_hops)?;
+
+        // Evaluate each path
+        for path in paths {
+            let output = self.simulate_swap_path(&path, input_amount, pools)?;
+            if output > best_output {
+                best_output = output;
+                best_path = Some(path);
+            }
+        }
+
+        best_path.ok_or(ProgramError::InvalidArgument)
+    }
+
+    fn find_all_paths(
+        &self,
+        input_token: &Pubkey,
+        output_token: &Pubkey,
+        input_amount: u64,
+        pools: &[LiquidityPool],
+        max_hops: usize,
+    ) -> Result<Vec<SwapPath>, ProgramError> {
+        let mut paths = Vec::new();
+        let mut visited = HashSet::new();
+
+        self.dfs_find_paths(
+            input_token,
+            output_token,
+            input_amount,
+            pools,
+            max_hops,
+            &mut Vec::new(),
+            &mut visited,
+            &mut paths,
+        )?;
+
+        Ok(paths)
+    }
+
+    fn dfs_find_paths(
+        &self,
+        current_token: &Pubkey,
+        target_token: &Pubkey,
+        input_amount: u64,
+        pools: &[LiquidityPool],
+        remaining_hops: usize,
+        current_path: &mut Vec<Pubkey>,
+        visited: &mut HashSet<Pubkey>,
+        paths: &mut Vec<SwapPath>,
+    ) -> Result<(), ProgramError> {
+        if current_token == target_token {
+            // Found a path, calculate expected output
+            let output = self.simulate_swap_path(
+                &SwapPath {
+                    pools: current_path.clone(),
+                    expected_output: 0,
+                    price_impact: 0,
+                },
+                input_amount,
+                pools,
+            )?;
+
+            if output >= MIN_OUTPUT_AMOUNT_THRESHOLD {
+                paths.push(SwapPath {
+                    pools: current_path.clone(),
+                    expected_output: output,
+                    price_impact: self.calculate_price_impact(input_amount, output, pools)?,
+                });
+            }
+            return Ok(());
+        }
+
+        if remaining_hops == 0 {
+            return Ok(());
+        }
+
+        // Find all pools that contain the current token
+        for pool in pools {
+            if pool.token_a_mint == *current_token || pool.token_b_mint == *current_token {
+                let next_token = if pool.token_a_mint == *current_token {
+                    pool.token_b_mint
+                } else {
+                    pool.token_a_mint
+                };
+
+                if !visited.contains(&next_token) {
+                    visited.insert(next_token);
+                    current_path.push(pool.key());
+                    self.dfs_find_paths(
+                        &next_token,
+                        target_token,
+                        input_amount,
+                        pools,
+                        remaining_hops - 1,
+                        current_path,
+                        visited,
+                        paths,
+                    )?;
+                    current_path.pop();
+                    visited.remove(&next_token);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn simulate_swap_path(
+        &self,
+        path: &SwapPath,
+        input_amount: u64,
+        pools: &[LiquidityPool],
+    ) -> Result<u64, ProgramError> {
+        let mut current_amount = input_amount;
+        let mut current_token = path.pools[0];
+
+        for pool_key in &path.pools {
+            let pool = pools
+                .iter()
+                .find(|p| p.key() == *pool_key)
+                .ok_or(ProgramError::InvalidArgument)?;
+
+            current_amount = self.calculate_swap_output(pool, current_amount, current_token)?;
+
+            current_token = if pool.token_a_mint == current_token {
+                pool.token_b_mint
+            } else {
+                pool.token_a_mint
+            };
+        }
+
+        Ok(current_amount)
+    }
+
+    fn calculate_price_impact(
+        &self,
+        input_amount: u64,
+        output_amount: u64,
+        pools: &[LiquidityPool],
+    ) -> Result<u64, ProgramError> {
+        // Calculate price impact as percentage (in basis points)
+        let spot_price = self.calculate_spot_price(pools)?;
+        let execution_price = (output_amount as f64 / input_amount as f64) * 10000.0;
+        let price_impact = ((spot_price - execution_price) / spot_price * 10000.0) as u64;
+        Ok(price_impact)
+    }
+
+    fn calculate_spot_price(&self, pools: &[LiquidityPool]) -> Result<f64, ProgramError> {
+        // Calculate spot price from the first pool in the path
+        if let Some(pool) = pools.first() {
+            let reserve_a = pool.reserve_a as f64;
+            let reserve_b = pool.reserve_b as f64;
+            Ok(reserve_b / reserve_a)
+        } else {
+            Err(ProgramError::InvalidArgument)
+        }
+    }
+
+    pub fn execute_multi_hop_swap(
+        &mut self,
+        path: &SwapPath,
+        input_amount: u64,
+        min_output_amount: u64,
+        pools: &mut [LiquidityPool],
+    ) -> Result<u64, ProgramError> {
+        // Verify minimum output amount
+        let expected_output = self.simulate_swap_path(path, input_amount, pools)?;
+        if expected_output < min_output_amount {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Execute the swap through each pool in the path
+        let mut current_amount = input_amount;
+        let mut current_token = path.pools[0];
+
+        for pool_key in &path.pools {
+            let pool = pools
+                .iter_mut()
+                .find(|p| p.key() == *pool_key)
+                .ok_or(ProgramError::InvalidArgument)?;
+
+            current_amount = self.execute_swap(pool, current_amount, current_token)?;
+
+            current_token = if pool.token_a_mint == current_token {
+                pool.token_b_mint
+            } else {
+                pool.token_a_mint
+            };
+        }
+
+        Ok(current_amount)
     }
 }
 
@@ -2444,5 +2960,157 @@ mod tests {
         let rewards1 = SharedLiquidityChecker::claim_rewards(&mut pool, &provider, 200).unwrap();
         let rewards2 = SharedLiquidityChecker::claim_rewards(&mut pool, &provider, 200).unwrap();
         assert_eq!(rewards2, 0); // Should get zero rewards for same timestamp
+    }
+
+    #[test]
+    fn test_concentrated_liquidity() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let provider = Pubkey::new_unique();
+
+        // Create liquidity pool
+        let mut pool = SharedLiquidityChecker::create_liquidity_pool(
+            token_a_mint,
+            token_b_mint,
+            30, // 0.3% fee
+            admin,
+        )
+        .unwrap();
+
+        // Test creating concentrated position
+        let position_id = SharedLiquidityChecker::create_concentrated_position(
+            &mut pool, &provider, 1000,  // token A amount
+            1000,  // token B amount
+            9000,  // lower price (0.9)
+            11000, // upper price (1.1)
+            100,   // current time
+        )
+        .unwrap();
+
+        // Verify position creation
+        let position = pool.enhanced_positions.get(&position_id).unwrap();
+        assert_eq!(position.ranges.len(), 1);
+        assert_eq!(position.position_id, position_id);
+        assert_eq!(position.created_at, 100);
+
+        // Test adding another range
+        assert!(SharedLiquidityChecker::add_range_to_position(
+            &mut pool,
+            position_id,
+            500,  // token A amount
+            500,  // token B amount
+            8000, // lower price (0.8)
+            9000, // upper price (0.9)
+            200,  // current time
+        )
+        .is_ok());
+
+        // Verify range addition
+        let position = pool.enhanced_positions.get(&position_id).unwrap();
+        assert_eq!(position.ranges.len(), 2);
+        assert_eq!(position.updated_at, 200);
+
+        // Test removing range
+        let (token_a_amount, token_b_amount) = SharedLiquidityChecker::remove_range_from_position(
+            &mut pool,
+            position_id,
+            0,   // first range
+            300, // current time
+        )
+        .unwrap();
+
+        // Verify range removal
+        let position = pool.enhanced_positions.get(&position_id).unwrap();
+        assert_eq!(position.ranges.len(), 1);
+        assert!(token_a_amount > 0);
+        assert!(token_b_amount > 0);
+
+        // Test fee collection
+        assert!(SharedLiquidityChecker::update_position_fees(
+            &mut pool, 1000, // input amount
+            990,  // output amount
+            400,  // current time
+        )
+        .is_ok());
+
+        let fees = SharedLiquidityChecker::collect_position_fees(&mut pool, position_id).unwrap();
+        assert!(fees > 0);
+
+        // Verify fees were collected
+        let position = pool.enhanced_positions.get(&position_id).unwrap();
+        assert_eq!(position.ranges[0].fees_collected, 0);
+    }
+
+    #[test]
+    fn test_concentrated_liquidity_edge_cases() {
+        let token_a_mint = Pubkey::new_unique();
+        let token_b_mint = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let provider = Pubkey::new_unique();
+
+        // Create liquidity pool
+        let mut pool =
+            SharedLiquidityChecker::create_liquidity_pool(token_a_mint, token_b_mint, 30, admin)
+                .unwrap();
+
+        // Test invalid price range
+        let result = SharedLiquidityChecker::create_concentrated_position(
+            &mut pool, &provider, 1000, 1000, 11000, // lower price > upper price
+            9000, 100,
+        );
+        assert!(result.is_err());
+
+        // Test range width limits
+        let result = SharedLiquidityChecker::create_concentrated_position(
+            &mut pool, &provider, 1000, 1000, 10000, 10001, // too narrow range
+            100,
+        );
+        assert!(result.is_err());
+
+        // Create valid position
+        let position_id = SharedLiquidityChecker::create_concentrated_position(
+            &mut pool, &provider, 1000, 1000, 9000, 11000, 100,
+        )
+        .unwrap();
+
+        // Test adding too many ranges
+        for _ in 0..MAX_RANGES_PER_POSITION {
+            assert!(SharedLiquidityChecker::add_range_to_position(
+                &mut pool,
+                position_id,
+                100,
+                100,
+                8000,
+                9000,
+                200,
+            )
+            .is_ok());
+        }
+
+        // Try to add one more range
+        let result = SharedLiquidityChecker::add_range_to_position(
+            &mut pool,
+            position_id,
+            100,
+            100,
+            8000,
+            9000,
+            200,
+        );
+        assert!(result.is_err());
+
+        // Test removing non-existent range
+        let result = SharedLiquidityChecker::remove_range_from_position(
+            &mut pool,
+            position_id,
+            MAX_RANGES_PER_POSITION as usize,
+            300,
+        );
+        assert!(result.is_err());
+
+        // Test collecting fees from non-existent position
+        let result = SharedLiquidityChecker::collect_position_fees(&mut pool, 999);
+        assert!(result.is_err());
     }
 }

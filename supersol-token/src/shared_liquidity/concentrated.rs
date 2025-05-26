@@ -238,4 +238,132 @@ impl ConcentratedLiquidityManager {
 
         Ok((amount_a, amount_b))
     }
+
+    /// Check if ranges overlap
+    fn check_range_overlap(
+        ranges: &[LiquidityRange],
+        new_lower: u64,
+        new_upper: u64,
+    ) -> ProgramResult {
+        for range in ranges {
+            if (new_lower <= range.upper_price && new_upper >= range.lower_price) {
+                return Err(ProgramError::Custom(10)); // Ranges overlap
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebalance ranges to optimize fee collection
+    pub fn rebalance_ranges(
+        pool: &mut SharedLiquidityPool,
+        position_id: u64,
+        target_ranges: Vec<(u64, u64)>,
+    ) -> ProgramResult {
+        // Find position
+        let position = pool
+            .enhanced_positions
+            .get_mut(&position_id)
+            .ok_or(ProgramError::InvalidAccountData)?;
+
+        // Validate target ranges
+        for (lower, upper) in &target_ranges {
+            if lower >= upper {
+                return Err(ProgramError::InvalidArgument);
+            }
+            Self::check_range_overlap(&position.ranges, *lower, *upper)?;
+        }
+
+        // Calculate total liquidity
+        let total_liquidity: u64 = position.ranges.iter().map(|r| r.liquidity).sum();
+
+        // Create new ranges
+        let mut new_ranges = Vec::new();
+        for (lower, upper) in target_ranges {
+            let liquidity = total_liquidity / target_ranges.len() as u64;
+            new_ranges.push(LiquidityRange {
+                lower_price: lower,
+                upper_price: upper,
+                liquidity,
+                fees_collected: 0,
+                last_update: Clock::get()?.unix_timestamp,
+            });
+        }
+
+        // Update position ranges
+        position.ranges = new_ranges;
+
+        Ok(())
+    }
+
+    /// Optimize range fees by merging adjacent ranges
+    pub fn optimize_range_fees(pool: &mut SharedLiquidityPool, position_id: u64) -> ProgramResult {
+        // Find position
+        let position = pool
+            .enhanced_positions
+            .get_mut(&position_id)
+            .ok_or(ProgramError::InvalidAccountData)?;
+
+        // Sort ranges by lower price
+        position
+            .ranges
+            .sort_by(|a, b| a.lower_price.cmp(&b.lower_price));
+
+        // Merge adjacent ranges with similar fees
+        let mut merged_ranges = Vec::new();
+        let mut current_range = position.ranges[0].clone();
+
+        for range in position.ranges.iter().skip(1) {
+            if range.lower_price == current_range.upper_price {
+                // Merge ranges
+                current_range.upper_price = range.upper_price;
+                current_range.liquidity = current_range
+                    .liquidity
+                    .checked_add(range.liquidity)
+                    .ok_or(ProgramError::Overflow)?;
+                current_range.fees_collected = current_range
+                    .fees_collected
+                    .checked_add(range.fees_collected)
+                    .ok_or(ProgramError::Overflow)?;
+            } else {
+                merged_ranges.push(current_range.clone());
+                current_range = range.clone();
+            }
+        }
+        merged_ranges.push(current_range);
+
+        // Update position ranges
+        position.ranges = merged_ranges;
+
+        Ok(())
+    }
+
+    /// Get optimal range distribution based on current price
+    pub fn get_optimal_ranges(
+        pool: &SharedLiquidityPool,
+        current_price: u64,
+        num_ranges: u8,
+    ) -> ProgramResult<Vec<(u64, u64)>> {
+        if num_ranges > MAX_RANGES_PER_POSITION {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let mut ranges = Vec::new();
+        let price_step = (MAX_RANGE_WIDTH - MIN_RANGE_WIDTH) / num_ranges as u32;
+
+        for i in 0..num_ranges {
+            let lower = current_price
+                .checked_mul(10000 - (price_step * (i + 1)))
+                .ok_or(ProgramError::Overflow)?
+                .checked_div(10000)
+                .ok_or(ProgramError::Overflow)?;
+            let upper = current_price
+                .checked_mul(10000 + (price_step * (i + 1)))
+                .ok_or(ProgramError::Overflow)?
+                .checked_div(10000)
+                .ok_or(ProgramError::Overflow)?;
+            ranges.push((lower, upper));
+        }
+
+        Ok(ranges)
+    }
 }

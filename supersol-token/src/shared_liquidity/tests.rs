@@ -186,4 +186,45 @@ mod tests {
         // Test non-existent position
         assert!(SharedLiquidityChecker::remove_liquidity(&mut pool, 999, 100,).is_err());
     }
+
+    #[test]
+    fn test_concentrated_liquidity_advanced() {
+        let mut pool = create_test_pool();
+        let owner = Pubkey::from_str("44444444444444444444444444444444").unwrap();
+
+        // Create initial position
+        let position_id = SharedLiquidityChecker::create_concentrated_position(
+            &mut pool, owner, 1000, 1000, 90, 110,
+        )
+        .unwrap();
+
+        // Test range overlap protection
+        assert!(SharedLiquidityChecker::add_range_to_position(
+            &mut pool,
+            position_id,
+            500,
+            500,
+            95,
+            105,
+        )
+        .is_err());
+
+        // Test range rebalancing
+        let target_ranges = vec![(85, 95), (95, 105), (105, 115)];
+        SharedLiquidityChecker::rebalance_ranges(&mut pool, position_id, target_ranges).unwrap();
+        assert_eq!(pool.enhanced_positions[&position_id].ranges.len(), 3);
+
+        // Test range fee optimization
+        SharedLiquidityChecker::optimize_range_fees(&mut pool, position_id).unwrap();
+        assert!(pool.enhanced_positions[&position_id].ranges.len() <= 3);
+
+        // Test optimal range calculation
+        let current_price = 100;
+        let optimal_ranges =
+            SharedLiquidityChecker::get_optimal_ranges(&pool, current_price, 3).unwrap();
+        assert_eq!(optimal_ranges.len(), 3);
+        assert!(optimal_ranges[0].0 < optimal_ranges[0].1);
+        assert!(optimal_ranges[1].0 < optimal_ranges[1].1);
+        assert!(optimal_ranges[2].0 < optimal_ranges[2].1);
+    }
 }

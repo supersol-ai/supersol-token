@@ -60,6 +60,7 @@ use crate::state::{Account, Mint};
 use solana_program_error::{ProgramError, ProgramResult};
 use solana_pubkey::Pubkey;
 use solana_sysvar::clock::Clock;
+use solana_sysvar::sysvar::Sysvar;
 use thiserror::Error;
 
 /// Custom error types for flash loan operations

@@ -2,10 +2,10 @@
 name = "supersol-token"
 version = "7.0.0"
 description = "SuperSol (SSOL) Token Program"
-authors = { workspace = true}
-repository = { workspace = true}
-license = { workspace = true}
-edition = { workspace = true}
+authors = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [features]
 no-entrypoint = []
@@ -30,7 +30,7 @@ solana-program-pack = "2.2.0"
 solana-pubkey = { version = "2.2.0", features = ["bytemuck"] }
 solana-rent = "2.2.0"
 solana-sdk-ids = "2.2.0"
-solana-sysvar = { version = "2.2.0", features = ["bincode"] }
+solana-sysvar = { version = "2.2.0", features = ["bincode", "sysvar"] }
 thiserror = "2.0"
 
 [dev-dependencies]

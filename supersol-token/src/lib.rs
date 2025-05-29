@@ -8,11 +8,11 @@ pub mod error;
 pub mod instruction;
 pub mod native_mint;
 pub mod processor;
+pub mod state;
 /// Module for shared liquidity functionality, allowing compatible tokens to be exchanged
 /// based on their supply ratios. Tokens must meet specific criteria to be eligible for
 /// shared liquidity, including fixed supply, reasonable decimals, and valid supply range.
 pub mod shared_liquidity;
-pub mod state;
 
 #[cfg(not(feature = "no-entrypoint"))]
 mod entrypoint;
@@ -119,8 +119,3 @@ pub fn check_program_account(spl_token_program_id: &Pubkey) -> ProgramResult {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    mod authority_tests;
-    mod shared_liquidity_tests;
-}

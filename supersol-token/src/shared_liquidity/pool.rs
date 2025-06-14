@@ -88,6 +88,7 @@ impl SharedLiquidityPool {
 
         // Create new position
         let position = LiquidityPosition {
+            id: self.next_position_id,
             owner,
             shares,
             last_claim_time: Clock::get()?.unix_timestamp,

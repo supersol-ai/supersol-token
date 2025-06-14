@@ -110,7 +110,7 @@ impl SwapManager {
         for (i, pool) in path.pools.iter().enumerate() {
             let is_token_a_to_b = i == 0 || path.pools[i - 1].token_b_mint == pool.token_a_mint;
             current_amount = Self::execute_swap(
-                pool,
+                &mut pools[i],
                 current_amount,
                 if i == path.pools.len() - 1 {
                     min_output_amount
